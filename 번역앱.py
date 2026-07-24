@@ -2,6 +2,8 @@ import io
 import os
 import re
 import time
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +14,112 @@ from openpyxl import load_workbook
 PRODUCT_TERMS = ["Suncron", "Sunfix", "Sunzol", "Suncion", "APEX", "SP-SE", "CP-R", "CP-D"]
 MAX_RESIDUE_TRANSLATION_PASSES = 3
 APP_PASSWORD = "5050"
+
+
+MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+
+def _merge_sheet_drawing_nodes(original_sheet_xml: bytes, translated_sheet_xml: bytes) -> bytes:
+	"""Keep drawing anchors (image references) from the original worksheet XML."""
+	try:
+		original_root = ET.fromstring(original_sheet_xml)
+		translated_root = ET.fromstring(translated_sheet_xml)
+	except ET.ParseError:
+		return translated_sheet_xml
+
+	drawing_tags = ["drawing", "legacyDrawing", "legacyDrawingHF", "picture"]
+
+	for tag in drawing_tags:
+		qtag = f"{{{MAIN_NS}}}{tag}"
+		for existing in list(translated_root.findall(qtag)):
+			translated_root.remove(existing)
+		for source_node in original_root.findall(qtag):
+			translated_root.append(ET.fromstring(ET.tostring(source_node)))
+
+	ET.register_namespace("", MAIN_NS)
+	return ET.tostring(translated_root, encoding="utf-8", xml_declaration=True)
+
+
+def _merge_content_types(original_content_types_xml: bytes, translated_content_types_xml: bytes) -> bytes:
+	"""Ensure drawing/image content-types survive after openpyxl save."""
+	try:
+		original_root = ET.fromstring(original_content_types_xml)
+		translated_root = ET.fromstring(translated_content_types_xml)
+	except ET.ParseError:
+		return translated_content_types_xml
+
+	existing_keys = set()
+	for child in translated_root:
+		if child.tag.endswith("Default"):
+			existing_keys.add(("Default", child.attrib.get("Extension", "").lower()))
+		elif child.tag.endswith("Override"):
+			existing_keys.add(("Override", child.attrib.get("PartName", "")))
+
+	for child in original_root:
+		if child.tag.endswith("Default"):
+			key = ("Default", child.attrib.get("Extension", "").lower())
+		elif child.tag.endswith("Override"):
+			key = ("Override", child.attrib.get("PartName", ""))
+		else:
+			continue
+
+		if key not in existing_keys:
+			translated_root.append(ET.fromstring(ET.tostring(child)))
+			existing_keys.add(key)
+
+	ET.register_namespace("", CT_NS)
+	return ET.tostring(translated_root, encoding="utf-8", xml_declaration=True)
+
+
+def _restore_embedded_graphics(original_xlsx: bytes, translated_xlsx: bytes) -> bytes:
+	"""Restore embedded drawings/images dropped by openpyxl round-trip."""
+	if not original_xlsx or not translated_xlsx:
+		return translated_xlsx
+
+	try:
+		with zipfile.ZipFile(io.BytesIO(original_xlsx), "r") as z_orig, zipfile.ZipFile(
+			io.BytesIO(translated_xlsx), "r"
+		) as z_new:
+			original_names = set(z_orig.namelist())
+			merged_files = {name: z_new.read(name) for name in z_new.namelist()}
+
+			sheet_rels_with_drawing = []
+			for name in original_names:
+				if not (name.startswith("xl/worksheets/_rels/") and name.endswith(".rels")):
+					continue
+				rels_xml = z_orig.read(name)
+				if b"/drawing" in rels_xml or b"legacyDrawing" in rels_xml:
+					sheet_rels_with_drawing.append(name)
+					merged_files[name] = rels_xml
+
+			for name in original_names:
+				if name.startswith("xl/drawings/") or name.startswith("xl/media/"):
+					merged_files[name] = z_orig.read(name)
+
+			for rel_name in sheet_rels_with_drawing:
+				sheet_file = rel_name.replace("xl/worksheets/_rels/", "xl/worksheets/").replace(".rels", "")
+				if sheet_file in merged_files and sheet_file in original_names:
+					merged_files[sheet_file] = _merge_sheet_drawing_nodes(
+						z_orig.read(sheet_file),
+						merged_files[sheet_file],
+					)
+
+			if "[Content_Types].xml" in original_names and "[Content_Types].xml" in merged_files:
+				merged_files["[Content_Types].xml"] = _merge_content_types(
+					z_orig.read("[Content_Types].xml"),
+					merged_files["[Content_Types].xml"],
+				)
+
+			result_buffer = io.BytesIO()
+			with zipfile.ZipFile(result_buffer, "w", compression=zipfile.ZIP_DEFLATED) as z_out:
+				for name, payload in merged_files.items():
+					z_out.writestr(name, payload)
+
+			return result_buffer.getvalue()
+	except Exception:
+		# If anything goes wrong, return the translated workbook without blocking download.
+		return translated_xlsx
 
 
 # 1. 페이지 설정
@@ -906,7 +1014,8 @@ def _translate_with_fallbacks(
 
 # 4. 엑셀 파일 번역 처리 엔진 (서식 보존)
 def process_excel(uploaded_file, target_lang, trans_dict):
-	wb = load_workbook(uploaded_file)
+	original_xlsx = uploaded_file.getvalue()
+	wb = load_workbook(io.BytesIO(original_xlsx))
 	normalized_dict = {_normalize_text_for_lookup(k): v for k, v in trans_dict.items()}
 	phrase_rules = _build_phrase_rules(trans_dict)
 	glossary_rules = _build_glossary_rules(target_lang)
@@ -956,8 +1065,11 @@ def process_excel(uploaded_file, target_lang, trans_dict):
 
 	output = io.BytesIO()
 	wb.save(output)
-	output.seek(0)
-	return output, stats
+	translated_xlsx = output.getvalue()
+	restored_xlsx = _restore_embedded_graphics(original_xlsx, translated_xlsx)
+	final_output = io.BytesIO(restored_xlsx)
+	final_output.seek(0)
+	return final_output, stats
 
 
 # 5. 앱 UI 구성 (메인 화면으로 번역란 이동)
