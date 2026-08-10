@@ -12,6 +12,11 @@ from openpyxl import load_workbook
 
 
 PRODUCT_TERMS = ["Suncron", "Sunfix", "Sunzol", "Suncion", "APEX", "SP-SE", "CP-R", "CP-D"]
+# 복합 제품명: 단어 단위로는 보호되지 않는 중간 단어(Ocean 등)를 포함한 전체 고유명사 목록
+COMPOUND_PRODUCT_NAMES = [
+	"Suncron Ocean APEX",
+	"Suncron Ocean",
+]
 MAX_RESIDUE_TRANSLATION_PASSES = 3
 APP_PASSWORD = "5050"
 
@@ -319,6 +324,16 @@ def _get_msds_glossary(target_lang: str):
 			"Chinese": "修订日期",
 		},
 		"version": {"Vietnamese": "phiên bản", "Spanish": "versión", "Chinese": "版本"},
+		"trade name/designation": {
+			"Vietnamese": "Tên thương mại/ký hiệu",
+			"Spanish": "Nombre comercial/designación",
+			"Chinese": "商品名/品牌名",
+		},
+		"trade name": {
+			"Vietnamese": "Tên thương mại",
+			"Spanish": "Nombre comercial",
+			"Chinese": "商品名",
+		},
 		"product name": {"Vietnamese": "tên sản phẩm", "Spanish": "nombre del producto", "Chinese": "产品名称"},
 		"product": {"Vietnamese": "sản phẩm", "Spanish": "producto", "Chinese": "产品"},
 		"recommended use": {
@@ -596,18 +611,27 @@ def _get_online_translator(target_lang: str):
 
 
 def _mask_product_terms(text: str):
-	product_pat = re.compile(r"\b(" + "|".join(re.escape(term) for term in PRODUCT_TERMS) + r")\b", re.IGNORECASE)
 	replacements: dict[str, str] = {}
 	idx = 0
 
-	def _repl(match):
+	def _make_key(original: str) -> str:
 		nonlocal idx
 		key = f"__KEEP_TERM_{idx}__"
-		replacements[key] = match.group(0)
+		replacements[key] = original
 		idx += 1
 		return key
 
-	return product_pat.sub(_repl, text), replacements
+	# 복합 제품명을 먼저 마스킹 (긴 것부터 처리해 부분 일치 방지)
+	result = text
+	for compound in sorted(COMPOUND_PRODUCT_NAMES, key=len, reverse=True):
+		pat = re.compile(re.escape(compound), re.IGNORECASE)
+		result = pat.sub(lambda m: _make_key(m.group(0)), result)
+
+	# 개별 제품 용어 마스킹
+	product_pat = re.compile(r"\b(" + "|".join(re.escape(term) for term in PRODUCT_TERMS) + r")\b", re.IGNORECASE)
+	result = product_pat.sub(lambda m: _make_key(m.group(0)), result)
+
+	return result, replacements
 
 
 def _unmask_product_terms(text: str, replacements: dict[str, str]):
@@ -905,6 +929,17 @@ def _apply_glossary_rules(text: str, glossary_rules):
 	return result, changed
 
 
+# 앞쪽 번호 접두사(1) , 2) , 3. , (1)  등) 보존 헬퍼
+_LEADING_PREFIX_RE = re.compile(r'^(\(?\d+[\)\.\:]\)?\s*)')
+
+def _strip_leading_prefix(text: str):
+	"""'1) ', '3. ', '(2) ' 같은 앞쪽 번호 접두사를 분리해 반환. (prefix, remainder)"""
+	m = _LEADING_PREFIX_RE.match(text)
+	if m:
+		return m.group(1), text[m.end():]
+	return "", text
+
+
 def _translate_with_fallbacks(
 	text: str,
 	target_lang: str,
@@ -1013,7 +1048,7 @@ def _translate_with_fallbacks(
 
 
 # 4. 엑셀 파일 번역 처리 엔진 (서식 보존)
-def process_excel(uploaded_file, target_lang, trans_dict):
+def process_excel(uploaded_file, target_lang, trans_dict, progress_callback=None):
 	original_xlsx = uploaded_file.getvalue()
 	wb = load_workbook(io.BytesIO(original_xlsx))
 	normalized_dict = {_normalize_text_for_lookup(k): v for k, v in trans_dict.items()}
@@ -1021,12 +1056,24 @@ def process_excel(uploaded_file, target_lang, trans_dict):
 	glossary_rules = _build_glossary_rules(target_lang)
 	online_translator = _get_online_translator(target_lang)
 
+	total_cells = 0
+	for sheet_name in wb.sheetnames:
+		ws = wb[sheet_name]
+		for row in ws.iter_rows():
+			for cell in row:
+				if cell.value and isinstance(cell.value, str) and cell.value.strip():
+					total_cells += 1
+
 	stats = {
 		"translated": 0,
 		"translated_online": 0,
 		"kept_original": 0,
 		"unmatched": 0,
 	}
+
+	processed_cells = 0
+	if progress_callback:
+		progress_callback(0, total_cells, "")
 
 	for sheet_name in wb.sheetnames:
 		ws = wb[sheet_name]
@@ -1046,8 +1093,10 @@ def process_excel(uploaded_file, target_lang, trans_dict):
 						cell.value = _apply_mandatory_term_replacements(processed_text, target_lang)
 						stats["kept_original"] += 1
 					else:
+						# 번호 접두사(1) , 3) , 2. 등) 보존: 번역 전 분리 후 재결합
+						leading_prefix, text_body = _strip_leading_prefix(original_text)
 						translated_text, status = _translate_with_fallbacks(
-							original_text,
+							text_body if leading_prefix else original_text,
 							target_lang,
 							trans_dict,
 							normalized_dict,
@@ -1055,6 +1104,8 @@ def process_excel(uploaded_file, target_lang, trans_dict):
 							glossary_rules,
 							online_translator,
 						)
+						if leading_prefix:
+							translated_text = leading_prefix + translated_text
 						if status == "translated":
 							stats["translated"] += 1
 						elif status == "translated_online":
@@ -1062,6 +1113,15 @@ def process_excel(uploaded_file, target_lang, trans_dict):
 						else:
 							stats["unmatched"] += 1
 						cell.value = _apply_mandatory_term_replacements(translated_text, target_lang)
+
+					processed_cells += 1
+					if progress_callback and (
+						processed_cells == total_cells or processed_cells % 10 == 0
+					):
+						progress_callback(processed_cells, total_cells, sheet_name)
+
+	if progress_callback:
+		progress_callback(total_cells, total_cells, "")
 
 	output = io.BytesIO()
 	wb.save(output)
@@ -1130,6 +1190,19 @@ if uploaded_file is not None:
 	st.info(f"선택 언어: **{target_lang_display}** | 예상 출력 파일명: **{new_filename}**")
 
 	if st.button("🚀 번역 실행 및 엑셀 생성", use_container_width=True):
+		progress_placeholder = st.empty()
+		progress_caption = st.empty()
+		progress_bar = progress_placeholder.progress(0, text="번역 준비 중입니다...")
+
+		def _update_progress(done: int, total: int, sheet: str):
+			pct = int((done / total) * 100) if total else 100
+			pct = max(0, min(100, pct))
+			status_text = f"번역 진행률: {done:,}/{total:,} 셀 ({pct}%)"
+			if sheet:
+				status_text += f" | 시트: {sheet}"
+			progress_bar.progress(pct, text=status_text)
+			progress_caption.caption(status_text)
+
 		with st.spinner(f"{target_lang_display}로 서식을 유지하며 번역 중입니다..."):
 			trans_dict, source_logs = load_translation_dict(target_lang)
 
@@ -1139,7 +1212,14 @@ if uploaded_file is not None:
 			if not trans_dict:
 				st.warning("⚠️ 번역 사전이 비어있어 원문이 그대로 유지될 수 있습니다. DB 파일 형식을 확인해주세요.")
 
-			processed_excel, stats = process_excel(uploaded_file, target_lang, trans_dict)
+			processed_excel, stats = process_excel(
+				uploaded_file,
+				target_lang,
+				trans_dict,
+				progress_callback=_update_progress,
+			)
+
+		progress_bar.progress(100, text="번역 진행률: 100% (완료)")
 
 		st.success("✅ 번역 완료! 아래 버튼을 눌러 결과 파일을 다운로드하세요.")
 		st.caption(
