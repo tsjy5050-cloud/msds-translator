@@ -2,8 +2,6 @@ import io
 import os
 import re
 import time
-import zipfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pandas as pd
@@ -12,119 +10,8 @@ from openpyxl import load_workbook
 
 
 PRODUCT_TERMS = ["Suncron", "Sunfix", "Sunzol", "Suncion", "APEX", "SP-SE", "CP-R", "CP-D"]
-# 복합 제품명: 단어 단위로는 보호되지 않는 중간 단어(Ocean 등)를 포함한 전체 고유명사 목록
-COMPOUND_PRODUCT_NAMES = [
-	"Suncron Ocean APEX",
-	"Suncron Ocean",
-]
 MAX_RESIDUE_TRANSLATION_PASSES = 3
 APP_PASSWORD = "5050"
-
-
-MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
-
-
-def _merge_sheet_drawing_nodes(original_sheet_xml: bytes, translated_sheet_xml: bytes) -> bytes:
-	"""Keep drawing anchors (image references) from the original worksheet XML."""
-	try:
-		original_root = ET.fromstring(original_sheet_xml)
-		translated_root = ET.fromstring(translated_sheet_xml)
-	except ET.ParseError:
-		return translated_sheet_xml
-
-	drawing_tags = ["drawing", "legacyDrawing", "legacyDrawingHF", "picture"]
-
-	for tag in drawing_tags:
-		qtag = f"{{{MAIN_NS}}}{tag}"
-		for existing in list(translated_root.findall(qtag)):
-			translated_root.remove(existing)
-		for source_node in original_root.findall(qtag):
-			translated_root.append(ET.fromstring(ET.tostring(source_node)))
-
-	ET.register_namespace("", MAIN_NS)
-	return ET.tostring(translated_root, encoding="utf-8", xml_declaration=True)
-
-
-def _merge_content_types(original_content_types_xml: bytes, translated_content_types_xml: bytes) -> bytes:
-	"""Ensure drawing/image content-types survive after openpyxl save."""
-	try:
-		original_root = ET.fromstring(original_content_types_xml)
-		translated_root = ET.fromstring(translated_content_types_xml)
-	except ET.ParseError:
-		return translated_content_types_xml
-
-	existing_keys = set()
-	for child in translated_root:
-		if child.tag.endswith("Default"):
-			existing_keys.add(("Default", child.attrib.get("Extension", "").lower()))
-		elif child.tag.endswith("Override"):
-			existing_keys.add(("Override", child.attrib.get("PartName", "")))
-
-	for child in original_root:
-		if child.tag.endswith("Default"):
-			key = ("Default", child.attrib.get("Extension", "").lower())
-		elif child.tag.endswith("Override"):
-			key = ("Override", child.attrib.get("PartName", ""))
-		else:
-			continue
-
-		if key not in existing_keys:
-			translated_root.append(ET.fromstring(ET.tostring(child)))
-			existing_keys.add(key)
-
-	ET.register_namespace("", CT_NS)
-	return ET.tostring(translated_root, encoding="utf-8", xml_declaration=True)
-
-
-def _restore_embedded_graphics(original_xlsx: bytes, translated_xlsx: bytes) -> bytes:
-	"""Restore embedded drawings/images dropped by openpyxl round-trip."""
-	if not original_xlsx or not translated_xlsx:
-		return translated_xlsx
-
-	try:
-		with zipfile.ZipFile(io.BytesIO(original_xlsx), "r") as z_orig, zipfile.ZipFile(
-			io.BytesIO(translated_xlsx), "r"
-		) as z_new:
-			original_names = set(z_orig.namelist())
-			merged_files = {name: z_new.read(name) for name in z_new.namelist()}
-
-			sheet_rels_with_drawing = []
-			for name in original_names:
-				if not (name.startswith("xl/worksheets/_rels/") and name.endswith(".rels")):
-					continue
-				rels_xml = z_orig.read(name)
-				if b"/drawing" in rels_xml or b"legacyDrawing" in rels_xml:
-					sheet_rels_with_drawing.append(name)
-					merged_files[name] = rels_xml
-
-			for name in original_names:
-				if name.startswith("xl/drawings/") or name.startswith("xl/media/"):
-					merged_files[name] = z_orig.read(name)
-
-			for rel_name in sheet_rels_with_drawing:
-				sheet_file = rel_name.replace("xl/worksheets/_rels/", "xl/worksheets/").replace(".rels", "")
-				if sheet_file in merged_files and sheet_file in original_names:
-					merged_files[sheet_file] = _merge_sheet_drawing_nodes(
-						z_orig.read(sheet_file),
-						merged_files[sheet_file],
-					)
-
-			if "[Content_Types].xml" in original_names and "[Content_Types].xml" in merged_files:
-				merged_files["[Content_Types].xml"] = _merge_content_types(
-					z_orig.read("[Content_Types].xml"),
-					merged_files["[Content_Types].xml"],
-				)
-
-			result_buffer = io.BytesIO()
-			with zipfile.ZipFile(result_buffer, "w", compression=zipfile.ZIP_DEFLATED) as z_out:
-				for name, payload in merged_files.items():
-					z_out.writestr(name, payload)
-
-			return result_buffer.getvalue()
-	except Exception:
-		# If anything goes wrong, return the translated workbook without blocking download.
-		return translated_xlsx
 
 
 # 1. 페이지 설정
@@ -324,16 +211,6 @@ def _get_msds_glossary(target_lang: str):
 			"Chinese": "修订日期",
 		},
 		"version": {"Vietnamese": "phiên bản", "Spanish": "versión", "Chinese": "版本"},
-		"trade name/designation": {
-			"Vietnamese": "Tên thương mại/ký hiệu",
-			"Spanish": "Nombre comercial/designación",
-			"Chinese": "商品名/品牌名",
-		},
-		"trade name": {
-			"Vietnamese": "Tên thương mại",
-			"Spanish": "Nombre comercial",
-			"Chinese": "商品名",
-		},
 		"product name": {"Vietnamese": "tên sản phẩm", "Spanish": "nombre del producto", "Chinese": "产品名称"},
 		"product": {"Vietnamese": "sản phẩm", "Spanish": "producto", "Chinese": "产品"},
 		"recommended use": {
@@ -592,7 +469,37 @@ def _contains_english_text(text: str) -> bool:
 	return bool(re.search(r"[A-Za-z]{3,}", text or ""))
 
 
-@st.cache_resource
+class _SafeTranslator:
+	"""Google 번역 래퍼: 연속 실패 시 즉시 온라인 번역을 끄고(서킷 브레이커) 무한 대기를 막는다."""
+
+	def __init__(self, inner, max_consecutive_failures: int = 3):
+		self.inner = inner
+		self.fails = 0
+		self.max_fails = max_consecutive_failures
+		self.disabled = False
+		self.last_error = ""
+
+	def translate(self, text: str):
+		if self.disabled:
+			return None
+		try:
+			result = self.inner.translate(text)
+			self.fails = 0
+			return result
+		except Exception as exc:  # noqa: BLE001
+			self.fails += 1
+			self.last_error = str(exc)[:200]
+			if self.fails >= self.max_fails:
+				self.disabled = True
+			return None
+
+
+def _pause(translator, sec: float):
+	# 온라인 번역이 꺼진 상태라면 기다릴 이유가 없다.
+	if translator is not None and not getattr(translator, "disabled", False):
+		time.sleep(sec)
+
+
 def _get_online_translator(target_lang: str):
 	target_map = {
 		"Vietnamese": "vi",
@@ -605,33 +512,24 @@ def _get_online_translator(target_lang: str):
 	try:
 		from deep_translator import GoogleTranslator
 
-		return GoogleTranslator(source="en", target=target_map[target_lang])
+		return _SafeTranslator(GoogleTranslator(source="en", target=target_map[target_lang]))
 	except Exception:
 		return None
 
 
 def _mask_product_terms(text: str):
+	product_pat = re.compile(r"\b(" + "|".join(re.escape(term) for term in PRODUCT_TERMS) + r")\b", re.IGNORECASE)
 	replacements: dict[str, str] = {}
 	idx = 0
 
-	def _make_key(original: str) -> str:
+	def _repl(match):
 		nonlocal idx
 		key = f"__KEEP_TERM_{idx}__"
-		replacements[key] = original
+		replacements[key] = match.group(0)
 		idx += 1
 		return key
 
-	# 복합 제품명을 먼저 마스킹 (긴 것부터 처리해 부분 일치 방지)
-	result = text
-	for compound in sorted(COMPOUND_PRODUCT_NAMES, key=len, reverse=True):
-		pat = re.compile(re.escape(compound), re.IGNORECASE)
-		result = pat.sub(lambda m: _make_key(m.group(0)), result)
-
-	# 개별 제품 용어 마스킹
-	product_pat = re.compile(r"\b(" + "|".join(re.escape(term) for term in PRODUCT_TERMS) + r")\b", re.IGNORECASE)
-	result = product_pat.sub(lambda m: _make_key(m.group(0)), result)
-
-	return result, replacements
+	return product_pat.sub(_repl, text), replacements
 
 
 def _unmask_product_terms(text: str, replacements: dict[str, str]):
@@ -707,7 +605,7 @@ def _apply_mandatory_term_replacements(text: str, target_lang: str) -> str:
 	return result
 
 
-def _online_translate_precise(text: str, target_lang: str, translator, delay_sec: float = 1.4):
+def _online_translate_precise(text: str, target_lang: str, translator, delay_sec: float = 0.3):
 	if target_lang not in {"Vietnamese", "Spanish", "Chinese"} or translator is None:
 		return text, False
 
@@ -717,14 +615,16 @@ def _online_translate_precise(text: str, target_lang: str, translator, delay_sec
 	masked_text, replacements = _mask_product_terms(text)
 
 	def _translate_with_retry(segment: str):
-		for _ in range(4):
+		for _ in range(2):
+			if getattr(translator, "disabled", False):
+				return None
 			try:
 				translated_segment = translator.translate(segment)
 				if translated_segment and translated_segment.strip():
 					return translated_segment.strip()
 			except Exception:
 				pass
-			time.sleep(delay_sec)
+			_pause(translator, delay_sec)
 		return None
 
 	# Multiline cells are translated line-by-line for better SDS table consistency.
@@ -742,7 +642,7 @@ def _online_translate_precise(text: str, target_lang: str, translator, delay_sec
 				changed = True
 			else:
 				out_lines.append(line)
-			time.sleep(delay_sec)
+			_pause(translator, delay_sec)
 
 		result = "\n".join(out_lines)
 		result = _unmask_product_terms(result, replacements)
@@ -763,7 +663,7 @@ def _online_translate_precise(text: str, target_lang: str, translator, delay_sec
 				changed = True
 			else:
 				out_parts.append(part)
-			time.sleep(delay_sec)
+			_pause(translator, delay_sec)
 		if changed:
 			result = " ".join(out_parts)
 			result = _unmask_product_terms(result, replacements)
@@ -771,7 +671,7 @@ def _online_translate_precise(text: str, target_lang: str, translator, delay_sec
 			return result, True
 
 	translated = _translate_with_retry(masked_text)
-	time.sleep(delay_sec)
+	_pause(translator, delay_sec)
 	if translated:
 		result = _unmask_product_terms(translated, replacements)
 		result = _finalize_translation(text, result)
@@ -780,7 +680,7 @@ def _online_translate_precise(text: str, target_lang: str, translator, delay_sec
 	return text, False
 
 
-def _translate_english_residue(text: str, target_lang: str, translator, glossary_rules, delay_sec: float = 1.6):
+def _translate_english_residue(text: str, target_lang: str, translator, glossary_rules, delay_sec: float = 0.3):
 	"""Last-chance pass: translate remaining English fragments when any residue is detected."""
 	if target_lang not in {"Vietnamese", "Spanish", "Chinese"} or translator is None:
 		return text, False
@@ -795,14 +695,16 @@ def _translate_english_residue(text: str, target_lang: str, translator, glossary
 	masked_text, replacements = _mask_product_terms(pre_glossary_text)
 
 	def _try_translate(fragment: str):
-		for _ in range(4):
+		for _ in range(2):
+			if getattr(translator, "disabled", False):
+				return None
 			try:
 				result = translator.translate(fragment)
 				if result and result.strip():
 					return result.strip()
 			except Exception:
 				pass
-			time.sleep(delay_sec)
+			_pause(translator, delay_sec)
 		return None
 
 	# Split by line first for SDS tables/paragraphs.
@@ -834,13 +736,13 @@ def _translate_english_residue(text: str, target_lang: str, translator, glossary
 					part_changed = True
 				else:
 					part_out.append(part)
-				time.sleep(delay_sec)
+				_pause(translator, delay_sec)
 			merged = " ".join(part_out)
 			out_lines.append(merged)
 			if part_changed:
 				changed = True
 
-		time.sleep(delay_sec)
+		_pause(translator, delay_sec)
 
 	result = "\n".join(out_lines) if "\n" in masked_text else out_lines[0]
 	result = _unmask_product_terms(result, replacements)
@@ -927,17 +829,6 @@ def _apply_glossary_rules(text: str, glossary_rules):
 			changed = True
 			result = new_result
 	return result, changed
-
-
-# 앞쪽 번호 접두사(1) , 2) , 3. , (1)  등) 보존 헬퍼
-_LEADING_PREFIX_RE = re.compile(r'^(\(?\d+[\)\.\:]\)?\s*)')
-
-def _strip_leading_prefix(text: str):
-	"""'1) ', '3. ', '(2) ' 같은 앞쪽 번호 접두사를 분리해 반환. (prefix, remainder)"""
-	m = _LEADING_PREFIX_RE.match(text)
-	if m:
-		return m.group(1), text[m.end():]
-	return "", text
 
 
 def _translate_with_fallbacks(
@@ -1034,7 +925,7 @@ def _translate_with_fallbacks(
 				target_lang,
 				online_translator,
 				glossary_rules,
-				delay_sec=1.8 + (0.4 * i),
+				delay_sec=0.3 + (0.2 * i),
 			)
 			if not changed or not _contains_english_text(progress_text):
 				break
@@ -1048,21 +939,12 @@ def _translate_with_fallbacks(
 
 
 # 4. 엑셀 파일 번역 처리 엔진 (서식 보존)
-def process_excel(uploaded_file, target_lang, trans_dict, progress_callback=None):
-	original_xlsx = uploaded_file.getvalue()
-	wb = load_workbook(io.BytesIO(original_xlsx))
+def process_excel(uploaded_file, target_lang, trans_dict):
+	wb = load_workbook(uploaded_file)
 	normalized_dict = {_normalize_text_for_lookup(k): v for k, v in trans_dict.items()}
 	phrase_rules = _build_phrase_rules(trans_dict)
 	glossary_rules = _build_glossary_rules(target_lang)
 	online_translator = _get_online_translator(target_lang)
-
-	total_cells = 0
-	for sheet_name in wb.sheetnames:
-		ws = wb[sheet_name]
-		for row in ws.iter_rows():
-			for cell in row:
-				if cell.value and isinstance(cell.value, str) and cell.value.strip():
-					total_cells += 1
 
 	stats = {
 		"translated": 0,
@@ -1071,15 +953,27 @@ def process_excel(uploaded_file, target_lang, trans_dict, progress_callback=None
 		"unmatched": 0,
 	}
 
-	processed_cells = 0
-	if progress_callback:
-		progress_callback(0, total_cells, "")
+	total_cells = sum(
+		1
+		for ws_ in wb.worksheets
+		for row_ in ws_.iter_rows()
+		for c_ in row_
+		if isinstance(c_.value, str) and c_.value.strip()
+	)
+	progress = st.progress(0.0, text=f"번역 준비 중... (총 {total_cells:,}개 셀)")
+	done = 0
 
 	for sheet_name in wb.sheetnames:
 		ws = wb[sheet_name]
 		for row in ws.iter_rows():
 			for cell in row:
-				if cell.value and isinstance(cell.value, str):
+				if cell.value and isinstance(cell.value, str) and cell.value.strip():
+					done += 1
+					if done % 5 == 0 or done == total_cells:
+						progress.progress(
+							min(done / max(total_cells, 1), 1.0),
+							text=f"[{sheet_name}] {done:,}/{total_cells:,} 셀 처리 중",
+						)
 					original_text = cell.value.strip()
 					if not original_text:
 						continue
@@ -1093,10 +987,8 @@ def process_excel(uploaded_file, target_lang, trans_dict, progress_callback=None
 						cell.value = _apply_mandatory_term_replacements(processed_text, target_lang)
 						stats["kept_original"] += 1
 					else:
-						# 번호 접두사(1) , 3) , 2. 등) 보존: 번역 전 분리 후 재결합
-						leading_prefix, text_body = _strip_leading_prefix(original_text)
 						translated_text, status = _translate_with_fallbacks(
-							text_body if leading_prefix else original_text,
+							original_text,
 							target_lang,
 							trans_dict,
 							normalized_dict,
@@ -1104,8 +996,6 @@ def process_excel(uploaded_file, target_lang, trans_dict, progress_callback=None
 							glossary_rules,
 							online_translator,
 						)
-						if leading_prefix:
-							translated_text = leading_prefix + translated_text
 						if status == "translated":
 							stats["translated"] += 1
 						elif status == "translated_online":
@@ -1114,22 +1004,18 @@ def process_excel(uploaded_file, target_lang, trans_dict, progress_callback=None
 							stats["unmatched"] += 1
 						cell.value = _apply_mandatory_term_replacements(translated_text, target_lang)
 
-					processed_cells += 1
-					if progress_callback and (
-						processed_cells == total_cells or processed_cells % 10 == 0
-					):
-						progress_callback(processed_cells, total_cells, sheet_name)
-
-	if progress_callback:
-		progress_callback(total_cells, total_cells, "")
+	progress.empty()
+	if online_translator is not None and getattr(online_translator, "disabled", False):
+		st.warning(
+			"⚠️ Google 온라인 번역 연결이 실패하여 중간에 온라인 번역을 건너뛰었습니다. "
+			"Master_DB/용어집으로 번역되지 않은 문장은 영문으로 남아 있을 수 있습니다. "
+			f"(오류: {online_translator.last_error})"
+		)
 
 	output = io.BytesIO()
 	wb.save(output)
-	translated_xlsx = output.getvalue()
-	restored_xlsx = _restore_embedded_graphics(original_xlsx, translated_xlsx)
-	final_output = io.BytesIO(restored_xlsx)
-	final_output.seek(0)
-	return final_output, stats
+	output.seek(0)
+	return output, stats
 
 
 # 5. 앱 UI 구성 (메인 화면으로 번역란 이동)
@@ -1189,20 +1075,7 @@ if uploaded_file is not None:
 
 	st.info(f"선택 언어: **{target_lang_display}** | 예상 출력 파일명: **{new_filename}**")
 
-	if st.button("🚀 번역 실행 및 엑셀 생성", use_container_width=True):
-		progress_placeholder = st.empty()
-		progress_caption = st.empty()
-		progress_bar = progress_placeholder.progress(0, text="번역 준비 중입니다...")
-
-		def _update_progress(done: int, total: int, sheet: str):
-			pct = int((done / total) * 100) if total else 100
-			pct = max(0, min(100, pct))
-			status_text = f"번역 진행률: {done:,}/{total:,} 셀 ({pct}%)"
-			if sheet:
-				status_text += f" | 시트: {sheet}"
-			progress_bar.progress(pct, text=status_text)
-			progress_caption.caption(status_text)
-
+	if st.button("🚀 번역 실행 및 엑셀 생성", width="stretch"):
 		with st.spinner(f"{target_lang_display}로 서식을 유지하며 번역 중입니다..."):
 			trans_dict, source_logs = load_translation_dict(target_lang)
 
@@ -1212,14 +1085,7 @@ if uploaded_file is not None:
 			if not trans_dict:
 				st.warning("⚠️ 번역 사전이 비어있어 원문이 그대로 유지될 수 있습니다. DB 파일 형식을 확인해주세요.")
 
-			processed_excel, stats = process_excel(
-				uploaded_file,
-				target_lang,
-				trans_dict,
-				progress_callback=_update_progress,
-			)
-
-		progress_bar.progress(100, text="번역 진행률: 100% (완료)")
+			processed_excel, stats = process_excel(uploaded_file, target_lang, trans_dict)
 
 		st.success("✅ 번역 완료! 아래 버튼을 눌러 결과 파일을 다운로드하세요.")
 		st.caption(
